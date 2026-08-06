@@ -12,3 +12,4 @@ fi
 
 # Wait for all background jobs
 wait
+
