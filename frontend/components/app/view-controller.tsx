@@ -1,5 +1,7 @@
 'use client';
 
+import { useState } from 'react';
+import { ConnectionState } from 'livekit-client';
 import { useTheme } from 'next-themes';
 import { AnimatePresence, motion } from 'motion/react';
 import { useSessionContext } from '@livekit/components-react';
@@ -33,22 +35,49 @@ interface ViewControllerProps {
 }
 
 export function ViewController({ appConfig }: ViewControllerProps) {
-  const { isConnected, start } = useSessionContext();
+  const { isConnected, start, connectionState } = useSessionContext();
   const { resolvedTheme } = useTheme();
+  const [hasStartedSession, setHasStartedSession] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
+  const [isLaunching, setIsLaunching] = useState(false);
+
+  const isConnecting =
+    !isConnected &&
+    [ConnectionState.Connecting, ConnectionState.Reconnecting, ConnectionState.SignalReconnecting].includes(
+      connectionState
+    );
+  const showEndedState = hasStartedSession && !isConnected && !isConnecting;
+
+  async function handleStartCall() {
+    if (isLaunching || isConnecting) return;
+
+    setConnectError(null);
+    setHasStartedSession(true);
+    setIsLaunching(true);
+
+    try {
+      if (typeof window !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      }
+
+      await start();
+    } catch (error) {
+      const message =
+        error instanceof DOMException && error.name === 'NotAllowedError'
+          ? 'Microphone access is blocked.'
+          : 'Unable to connect. Please check your internet connection and try again.';
+
+      setHasStartedSession(false);
+      setConnectError(message);
+    } finally {
+      setIsLaunching(false);
+    }
+  }
 
   return (
     <AnimatePresence mode="wait">
-      {/* Welcome view */}
-      {!isConnected && (
-        <MotionWelcomeView
-          key="welcome"
-          {...VIEW_MOTION_PROPS}
-          startButtonText={appConfig.startButtonText}
-          onStartCall={start}
-        />
-      )}
-      {/* Session view */}
-      {isConnected && (
+      {isConnected ? (
         <MotionSessionView
           key="session-view"
           {...VIEW_MOTION_PROPS}
@@ -70,6 +99,17 @@ export function ViewController({ appConfig }: ViewControllerProps) {
           audioVisualizerRadialRadius={appConfig.audioVisualizerRadialRadius}
           audioVisualizerWaveLineWidth={appConfig.audioVisualizerWaveLineWidth}
           className="fixed inset-0"
+        />
+      ) : (
+        <MotionWelcomeView
+          key={isConnecting ? 'connecting' : showEndedState ? 'ended' : 'welcome'}
+          {...VIEW_MOTION_PROPS}
+          companyName={appConfig.companyName}
+          startButtonText={appConfig.startButtonText}
+          mode={isConnecting ? 'connecting' : showEndedState ? 'ended' : 'ready'}
+          onStartCall={handleStartCall}
+          isBusy={isLaunching || isConnecting}
+          errorMessage={connectError}
         />
       )}
     </AnimatePresence>
