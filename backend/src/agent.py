@@ -27,6 +27,17 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
 
+    async def on_enter(self) -> None:
+        greeting = (
+            "Hi! I am your AI Learning Assistant. I can help you learn new concepts, "
+            "practice English, improve vocabulary, or study for your next lesson. "
+            "What would you like to explore today?"
+        )
+
+        activity = getattr(self, "_activity", None)
+        if activity is not None and hasattr(activity, "say"):
+            activity.say(greeting)
+
     # To add tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
     # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
