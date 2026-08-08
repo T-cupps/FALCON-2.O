@@ -189,6 +189,37 @@ export function AgentSessionView_01({
     screenShare: supportsScreenShare,
   };
 
+  const stateCopy = {
+    connecting: {
+      title: 'Connecting to your learning assistant...',
+      subtitle: 'Please wait while the lesson space is ready.',
+      accent: 'border-primary/20 bg-primary/10 text-primary',
+    },
+    'pre-connect-buffering': {
+      title: 'Preparing your lesson...',
+      subtitle: 'Your voice learning companion is warming up.',
+      accent: 'border-primary/20 bg-primary/10 text-primary',
+    },
+    listening: {
+      title: 'Listening to you...',
+      subtitle: 'Speak naturally and I will help you learn.',
+      accent: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+    },
+    speaking: {
+      title: 'AI Assistant is speaking...',
+      subtitle: 'Your learning companion is sharing ideas with you.',
+      accent: 'border-violet-500/20 bg-violet-500/10 text-violet-600 dark:text-violet-400',
+    },
+    thinking: {
+      title: 'Thinking about your question...',
+      subtitle: 'I am crafting a clear explanation for you.',
+      accent: 'border-amber-500/20 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+    },
+  } as const;
+
+  const activeState = agentState in stateCopy ? agentState : 'connecting';
+  const currentState = stateCopy[activeState as keyof typeof stateCopy];
+
   useEffect(() => {
     const lastMessage = messages.at(-1);
     const lastMessageIsLocal = lastMessage?.from?.isLocal === true;
@@ -222,6 +253,33 @@ export function AgentSessionView_01({
             </motion.div>
           )}
         </AnimatePresence>
+      </div>
+      <div className="absolute inset-x-4 top-5 z-[60] flex justify-center md:inset-x-8 md:top-6">
+        <div className="w-full max-w-2xl rounded-full border border-border/70 bg-background/90 px-4 py-3 shadow-sm backdrop-blur">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-3">
+              <div className={cn('flex h-10 w-10 items-center justify-center rounded-full border', currentState.accent)}>
+                <span className="text-sm font-semibold">
+                  {agentState === 'speaking' ? '🔊' : agentState === 'listening' ? '🎤' : '✨'}
+                </span>
+              </div>
+              <div className="min-w-0 text-left">
+                <p className="text-sm font-semibold text-foreground">{currentState.title}</p>
+                <p className="text-xs text-muted-foreground">{currentState.subtitle}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+              <span className="inline-flex items-center gap-2 rounded-full border border-border/70 px-2.5 py-1">
+                <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                You
+              </span>
+              <span className="inline-flex items-center gap-2 rounded-full border border-border/70 px-2.5 py-1">
+                <span className="h-2 w-2 rounded-full bg-violet-500" />
+                AI Assistant
+              </span>
+            </div>
+          </div>
+        </div>
       </div>
       {/* Tile layout */}
       <TileLayout
