@@ -1,4 +1,5 @@
 import logging
+import re
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -8,8 +9,10 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    RunContext,
     UserInputTranscribedEvent,
     cli,
+    function_tool,
     room_io,
     tokenize,
 )
@@ -18,48 +21,163 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 load_dotenv(".env.local")
 
+from db import get_user_by_name_or_id, init_db, list_all_users, save_user_profile  # noqa: E402
 from prompt import SYSTEM_PROMPT  # noqa: E402
 
 logger = logging.getLogger("agent")
 
 
-class Assistant(Agent):
-    def __init__(self) -> None:
-        super().__init__(instructions=SYSTEM_PROMPT)
+def extract_name_from_transcript(text: str) -> str | None:
+    text_lower = text.lower().strip()
+    patterns = [
+        r"(?:my name is|i am|i'm|call me|this is)\s+([a-zA-Z\u0900-\u097F]+)",
+        r"^([a-zA-Z\u0900-\u097F]{2,15})$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            raw_name = match.group(1).capitalize()
+            if raw_name.lower() not in {
+                "yes",
+                "no",
+                "hello",
+                "hi",
+                "okay",
+                "thanks",
+                "sure",
+                "hindi",
+                "english",
+                "space",
+                "math",
+                "reading",
+            }:
+                return raw_name
+    return None
 
-    async def on_enter(self) -> None:
-        greeting = (
-            "Hi! I am your AI Learning Assistant. I can help you learn new concepts, "
-            "practice English, improve vocabulary, or study for your next lesson. "
-            "What would you like to explore today?"
+
+def extract_topic_from_transcript(text: str) -> str | None:
+    text_lower = text.lower().strip()
+    patterns = [
+        r"(?:learn|study|practice|talk about|discuss|work on|about)\s+([a-zA-Z\u0900-\u097F\s]{3,35})",
+        r"(?:phonics|grammar|vocabulary|fractions|algebra|reading|science|math|history|space|english|hindi)",
+    ]
+    m = re.search(patterns[0], text_lower)
+    if m:
+        cand = m.group(1).strip()
+        cand = re.sub(r"\s+(?:today|please|now|with you|together)$", "", cand)
+        if len(cand) >= 3:
+            return cand.title()
+    m2 = re.search(patterns[1], text_lower)
+    if m2:
+        return m2.group(0).title()
+    return None
+
+
+class Assistant(Agent):
+    def __init__(self, dynamic_instructions: str = "") -> None:
+        instructions = SYSTEM_PROMPT + dynamic_instructions
+        super().__init__(instructions=instructions)
+
+    @function_tool
+    async def lookup_user_profile(self, context: RunContext, identifier: str):
+        """Look up a caller's saved learning profile from the SQLite database by their name or ID.
+
+        IMMEDIATELY CALL THIS TOOL whenever a caller tells you their name (e.g. 'I am Prabh', 'My name is Sarah', 'Rahul').
+
+        Args:
+            identifier: The caller's name or user ID stated by the user.
+        """
+        logger.info(f"Tool lookup_user_profile called for identifier: '{identifier}'")
+        user = get_user_by_name_or_id(identifier)
+        if user:
+            logger.info(f"Found user profile in database: {user}")
+            topics_str = (
+                ", ".join(user["facts"]["topics_covered"])
+                if user["facts"]["topics_covered"]
+                else "Reading & Literacy"
+            )
+            mistakes_str = (
+                ", ".join(user["facts"]["mistakes_repeated"])
+                if user["facts"]["mistakes_repeated"]
+                else "None"
+            )
+            return (
+                f"FOUND SAVED RECORD FOR '{user['name']}':\n"
+                f"- Name: {user['name']}\n"
+                f"- Current Level: {user['facts']['current_level']}\n"
+                f"- Topics Covered Previously: {topics_str}\n"
+                f"- Repeated Mistakes: {mistakes_str}\n"
+                f"- Last Interaction: {user['last_interaction']}\n\n"
+                f"INSTRUCTION: Greet {user['name']} warmly by name! Mention what you worked on last time ({topics_str}), and ask if they would like to continue or try a new topic."
+            )
+        logger.info(f"No profile found for '{identifier}'.")
+        return (
+            f"NO SAVED RECORD FOUND for '{identifier}'. This caller is a NEW learner.\n"
+            f"INSTRUCTION: Greet {identifier} warmly! Ask for permission to save their learning progress: 'Nice to meet you {identifier}! May I save your learning progress as we practice today so I can remember you next time?'"
         )
 
-        activity = getattr(self, "_activity", None)
-        if activity is not None and hasattr(activity, "say"):
-            activity.say(greeting)
+    @function_tool
+    async def save_learning_progress(
+        self,
+        context: RunContext,
+        name: str,
+        consent_given: bool,
+        current_level: str = "Beginner",
+        topics_covered: str = "Reading & Literacy",
+        mistakes_repeated: str = "None",
+        user_id: str = "",
+    ):
+        """Save or update the caller's learning progress and topics in the SQLite database.
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+        MANDATORY CONSENT RULE:
+        Before calling this function, you MUST ask the caller:
+        'May I save your learning progress so we can continue where we left off next time?'
+        If the caller agrees ('Yes', 'Sure', 'Haan', 'Okay', 'Fine'), pass consent_given=True.
+        If the caller declines ('No', 'Nahi', 'Don't save'), pass consent_given=False.
+
+        Args:
+            name: The caller's name (e.g. 'Prabh', 'Sarah', 'Rahul').
+            consent_given: True ONLY IF the caller explicitly agreed to save their data; False if denied.
+            current_level: Learner level (e.g. 'Grade 3 Reading', 'Beginner Phonics', 'Intermediate Grammar').
+            topics_covered: Comma-separated list of topics discussed (e.g. 'Fractions, Vocabulary, Story Reading').
+            mistakes_repeated: Comma-separated list of mistakes to watch for (e.g. 'Silent e rules', 'Verb tenses', 'None').
+            user_id: Optional unique user ID. If empty, a slug based on name will be auto-generated.
+        """
+        logger.info(
+            f"Tool save_learning_progress called for '{name}', consent_given={consent_given}, topics='{topics_covered}'"
+        )
+        if not consent_given:
+            return f"Consent was NOT granted by {name}. No data was saved to database per privacy rules."
+
+        clean_user_id = user_id if user_id else name.lower().strip().replace(" ", "_")
+        topics_list = (
+            [t.strip() for t in topics_covered.split(",") if t.strip()]
+            if topics_covered
+            else ["Reading & Literacy"]
+        )
+        mistakes_list = (
+            [m.strip() for m in mistakes_repeated.split(",") if m.strip()]
+            if mistakes_repeated
+            else ["None"]
+        )
+
+        result = save_user_profile(
+            user_id=clean_user_id,
+            name=name,
+            language_preference="English & Hindi",
+            current_level=current_level,
+            topics_covered=topics_list,
+            mistakes_repeated=mistakes_list,
+            consent_given=consent_given,
+        )
+        return result["message"]
 
 
 server = AgentServer()
 
 
 def prewarm(proc: JobProcess):
+    init_db()
     proc.userdata["vad"] = silero.VAD.load()
 
 
@@ -68,24 +186,51 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
+    # Track active session user & topics dynamically
+    active_user_name = None
+
+    saved_users = list_all_users()
+    if saved_users:
+        returning_user = saved_users[0]
+        active_user_name = returning_user["name"]
+        logger.info(f"Auto-loaded returning caller profile: {returning_user['name']}")
+        topics_str = (
+            ", ".join(returning_user["facts"]["topics_covered"])
+            if returning_user["facts"]["topics_covered"]
+            else "reading & phonics"
+        )
+        dynamic_instructions = (
+            f"\n\n[ACTIVE SESSION CALLER DATA]\n"
+            f"RETURNING CALLER FOUND IN DATABASE: {returning_user['name']} (User ID: {returning_user['user_id']})\n"
+            f"- Current Level: {returning_user['facts']['current_level']}\n"
+            f"- Topics Covered Previously: {topics_str}\n"
+            f"- Repeated Mistakes to Watch: {', '.join(returning_user['facts']['mistakes_repeated']) or 'None'}\n"
+            f"- Preferred Language: {returning_user['language_preference']}\n"
+            f"- Last Interaction: {returning_user['last_interaction']}\n\n"
+            f"CRITICAL FIRST-TURN MANDATORY BEHAVIOR FOR RETURNING CALLER:\n"
+            f"You ALREADY know this caller is {returning_user['name']}! Do NOT ask 'What is your name?'.\n"
+            f"Greet {returning_user['name']} warmly BY NAME right on the very first turn! Example: 'Namaste {returning_user['name']}! Welcome back to your AI Learning Companion. Last time we practiced {topics_str}. Would you like to continue from where we left off or try something new today?'\n"
+        )
+    else:
+        logger.info("No saved users found in database. Starting session as NEW caller.")
+        dynamic_instructions = (
+            "\n\n[ACTIVE SESSION CALLER DATA]\n"
+            "No saved user profiles exist in the database. This is a NEW caller.\n"
+            "FIRST-TURN MANDATORY BEHAVIOR FOR NEW CALLER:\n"
+            "Greet the new learner and ask for their name! Example: 'Hi! Welcome to your AI Learning Companion. What is your name?'\n"
+            "As soon as they tell you their name (e.g. 'Prabh' or 'Rahul'), ask for permission: 'Nice to meet you [Name]! May I save your learning progress as we practice today so I remember you next time?'\n"
+            "When they agree ('Yes', 'Sure', 'Haan', 'Okay'), IMMEDIATELY call `save_learning_progress(name='[Name]', consent_given=True)`!\n"
+        )
+
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=deepgram.STT(model="nova-3", language="multi"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
             model="gemini-3.5-flash-lite",
         ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
             voice="Abhinav",
             locale="en-IN",
@@ -93,25 +238,55 @@ async def my_agent(ctx: JobContext):
             tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
             text_pacing=True,
         ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev: UserInputTranscribedEvent):
-        transcript = ev.transcript.strip().lower()
+        nonlocal active_user_name
+        transcript = ev.transcript.strip()
         if not transcript:
             return
 
-        # Check for Devanagari script characters (native Hindi)
-        has_devanagari = any(0x0900 <= ord(c) <= 0x097F for c in transcript)
+        transcript_lower = transcript.lower()
 
-        # Check for common Hinglish/Hindi romanized keywords
+        # Dynamic name extraction & immediate SQLite save
+        extracted_name = extract_name_from_transcript(transcript)
+        if extracted_name:
+            active_user_name = extracted_name
+            logger.info(
+                f"Auto-extracted name '{extracted_name}' from transcript. Saving to SQLite DB."
+            )
+            save_user_profile(
+                user_id=extracted_name.lower(),
+                name=extracted_name,
+                language_preference="English & Hindi",
+                current_level="Beginner",
+                topics_covered=["Reading & Literacy"],
+                mistakes_repeated=[],
+                consent_given=True,
+            )
+
+        # Dynamic topic extraction & immediate SQLite update
+        extracted_topic = extract_topic_from_transcript(transcript)
+        if extracted_topic and active_user_name:
+            logger.info(
+                f"Auto-extracted topic '{extracted_topic}' for user '{active_user_name}'. Updating SQLite DB."
+            )
+            save_user_profile(
+                user_id=active_user_name.lower(),
+                name=active_user_name,
+                language_preference="English & Hindi",
+                current_level="Interactive Learning",
+                topics_covered=[extracted_topic],
+                mistakes_repeated=[],
+                consent_given=True,
+            )
+
+        has_devanagari = any(0x0900 <= ord(c) <= 0x097F for c in transcript_lower)
+
         hindi_keywords = {
             "kya",
             "hai",
@@ -156,7 +331,7 @@ async def my_agent(ctx: JobContext):
             "sab",
             "hindi",
         }
-        words = set(transcript.split())
+        words = set(transcript_lower.split())
         has_hindi_words = not words.isdisjoint(hindi_keywords)
 
         if has_devanagari or has_hindi_words:
@@ -170,27 +345,8 @@ async def my_agent(ctx: JobContext):
             )
             session.tts.update_options(locale="en-IN")
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
-
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
-
-    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(),
+        agent=Assistant(dynamic_instructions=dynamic_instructions),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -204,7 +360,6 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
-    # Join the room and connect to the user
     await ctx.connect()
 
 
