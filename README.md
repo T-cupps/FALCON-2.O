@@ -1,4 +1,4 @@
-# Voice Agent Starter — Powered by Murf Falcon
+README.md   ->  # Voice Agent Starter — Powered by Murf Falcon
 
 Build a production voice AI agent in 5 minutes. Powered by the fastest TTS on the market - swap the system prompt to build anything from customer support to language tutors.
 
@@ -270,6 +270,55 @@ For deeper documentation on each part, see:
 - [TTS Latency Benchmarker](https://github.com/sahilsgupta/tts-latency-benchmarker) — run your own p50/p95 tests across providers
 - [Murf Discord](https://discord.gg/FbKAy96Sz7)
 - [Murf Startup Incubator](https://murf.ai/api) — 50M free characters for startups
+
+---
+
+## Day 5 — Function Calling & Persistent Conversation Memory
+
+The AI voice agent focused on **Learning & Literacy**. On Day 5, the following capabilities were added without breaking any existing functionality:
+
+### 1. Function Calling (`get_exercise(level)`)
+
+- **Function Tool**: `get_exercise(level)`
+- **Supported Levels**: `beginner`, `intermediate`, `advanced`
+- **Purpose**: Retrieves an English learning exercise tailored to the learner's requested difficulty level.
+- **When Ved Calls It**: When the user requests practice (e.g., "give me a beginner English question", "quiz me on grammar", or "speaking practice activity").
+- **Local Dataset**: Hand-built local dataset (`backend/src/exercises.json`).
+- **Dataset Update Date**: **Last updated: August 10, 2026** (Does not claim to be a live external API).
+- **Failure Handling**:
+  - Exercise data failure / missing file: Ved responds with `"Sorry, I'm having trouble getting a learning exercise right now. Please try again in a moment."`
+  - Unsupported level (e.g. `expert`): Ved gracefully informs the user about supported levels (`beginner`, `intermediate`, `advanced`) and presents a starter exercise without crashing.
+
+### 2. Persistent Conversation Memory
+
+- **Database**: Reuses the project's existing SQLite database (`backend/database.db` managed via `backend/src/db.py`).
+- **Stored Information**:
+  - `session_id` (Room / Session identifier)
+  - `timestamp` (Auto-generated timestamp)
+  - `user_message` (User speech transcript)
+  - `agent_response` (Ved spoken response)
+  - `topic` (Learning topic/context)
+- **Context Retrieval**: Uses `get_previous_learning_context` to fetch the caller's last topic and conversation turns.
+- **Topic Continuation**: When a caller says *"Ved, what were we learning last time?"* or *"Let's continue my practice"*, Ved recalls the previous learning context (e.g., English Vocabulary) and calls `get_exercise(level)` to continue seamlessly.
+- **Memory Fallback Handling**:
+  - No previous memory: `"I don't have any previous learning session to continue yet. We can start one now."`
+  - Database access error: `"I'm having trouble accessing our previous conversation right now, but we can start a new practice session."`
+
+### 3. Testing Day 5 Functionality
+
+Run the dedicated Day 5 test suite:
+
+```bash
+cd backend
+.venv\Scripts\python.exe -m pytest tests/test_day5.py
+```
+
+Run the complete backend test suite:
+
+```bash
+cd backend
+.venv\Scripts\python.exe -m pytest
+```
 
 ---
 
