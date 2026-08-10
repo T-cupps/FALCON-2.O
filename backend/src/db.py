@@ -1,4 +1,4 @@
-db.py  ->   import json
+import json
 import logging
 import os
 import sqlite3
@@ -11,9 +11,11 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "database.db")
 
 def get_connection():
     """Get a SQLite database connection with row factory."""
-    conn = sqlite3.connect(DB_PATH)
+    current_db_path = os.environ.get("DB_PATH", DB_PATH)
+    conn = sqlite3.connect(current_db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 
 def init_db():
@@ -35,9 +37,23 @@ def init_db():
                 );
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    user_id TEXT DEFAULT '',
+                    user_message TEXT NOT NULL,
+                    agent_response TEXT NOT NULL,
+                    topic TEXT DEFAULT '',
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
         logger.info(f"Database initialized at {os.path.abspath(DB_PATH)}")
     finally:
         conn.close()
+
 
 
 def get_user_by_name_or_id(identifier: str) -> dict | None:
@@ -224,6 +240,154 @@ def list_all_users() -> list[dict]:
         return result
     finally:
         conn.close()
+
+
+def save_conversation_turn(
+    session_id: str,
+    user_id: str,
+    user_message: str,
+    agent_response: str,
+    topic: str = "",
+) -> dict:
+    """Save a conversation turn (user message & agent response) into SQLite database."""
+    conn = get_connection()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    clean_session_id = session_id or "default_session"
+    clean_user_id = user_id or "guest"
+    clean_user_msg = user_message.strip()
+    clean_agent_resp = agent_response.strip()
+
+    if not clean_user_msg or not clean_agent_resp:
+        return {"status": "skipped", "message": "Empty message or response, skipping save."}
+
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO conversation_memory (
+                    session_id, user_id, user_message, agent_response, topic, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_session_id,
+                    clean_user_id,
+                    clean_user_msg,
+                    clean_agent_resp,
+                    topic,
+                    now_str,
+                ),
+            )
+        logger.info(
+            f"Saved conversation turn for session '{clean_session_id}', topic '{topic}' into database."
+        )
+        return {"status": "success", "message": "Saved conversation turn to database."}
+    except Exception as e:
+        logger.error(f"Error saving conversation turn to database: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        conn.close()
+
+
+def get_recent_conversation_memory(
+    user_id: str = "", session_id: str = "", limit: int = 5
+) -> list[dict]:
+    """Retrieve recent conversation memory turns from SQLite database."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        if user_id:
+            cursor.execute(
+                """
+                SELECT * FROM conversation_memory
+                WHERE LOWER(user_id) = ? OR LOWER(session_id) = ?
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (user_id.lower().strip(), session_id.lower().strip(), limit),
+            )
+        elif session_id:
+            cursor.execute(
+                """
+                SELECT * FROM conversation_memory
+                WHERE LOWER(session_id) = ?
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (session_id.lower().strip(), limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT * FROM conversation_memory
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (limit,),
+            )
+        rows = cursor.fetchall()
+        turns = []
+        for r in reversed(rows):  # return in chronological order
+            turns.append(
+                {
+                    "id": r["id"],
+                    "session_id": r["session_id"],
+                    "user_id": r["user_id"],
+                    "user_message": r["user_message"],
+                    "agent_response": r["agent_response"],
+                    "topic": r["topic"],
+                    "timestamp": r["timestamp"],
+                }
+            )
+        return turns
+    except Exception as e:
+        logger.error(f"Error retrieving conversation memory from database: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_last_learning_topic(user_id: str = "", session_id: str = "") -> str | None:
+    """Retrieve the most recent learning topic or context from conversation memory or user profile."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        # First check conversation memory for recent explicit topic
+        if user_id:
+            cursor.execute(
+                """
+                SELECT topic FROM conversation_memory
+                WHERE (LOWER(user_id) = ? OR LOWER(session_id) = ?) AND topic != ''
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                (user_id.lower().strip(), session_id.lower().strip()),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT topic FROM conversation_memory
+                WHERE topic != ''
+                ORDER BY timestamp DESC LIMIT 1
+                """
+            )
+        row = cursor.fetchone()
+        if row and row["topic"]:
+            return row["topic"]
+
+        # Fallback to user_profiles topics for specified user
+        if user_id:
+            user = get_user_by_name_or_id(user_id)
+            if user and user["facts"]["topics_covered"]:
+                return user["facts"]["topics_covered"][-1]
+            return None
+
+        all_users = list_all_users()
+        if all_users and all_users[0]["facts"]["topics_covered"]:
+            return all_users[0]["facts"]["topics_covered"][-1]
+
+        return None
+    except Exception as e:
+        logger.error(f"Error getting last learning topic: {e}")
+        return None
+    finally:
+        conn.close()
+
 
 
 if __name__ == "__main__":
