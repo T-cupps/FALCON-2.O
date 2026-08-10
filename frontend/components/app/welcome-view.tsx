@@ -41,19 +41,19 @@ export const WelcomeView = ({
     ? 'Connecting to your travel companion...'
     : isEnded
       ? 'Travel session ended'
-      : 'Your AI Travel Companion';
+      : 'Your AI Verse & voyage';
 
   const subtitle = isConnecting
     ? 'Please wait while we prepare your travel assistant.'
     : isEnded
       ? 'Your conversation has ended. Start again whenever you are ready.'
-      : 'Plan your next adventure, one conversation at a time.';
+      : 'Go through your next adventure, one conversation at a time.';
 
   const body = isConnecting
-    ? 'We are getting your voice travel companion ready for you.'
+    ? 'We are getting your voice verse companion ready for you.'
     : isEnded
       ? 'Your travel session has ended. Start again to continue exploring.'
-      : 'Ask about destinations, plan your itinerary, discover places to visit, or get helpful travel tips with your AI travel companion.';
+      : 'Ask about destinations, discover places to visit, or get helpful travel tips with your AI Verse companion.';
 
   return (
     <div className="flex min-h-screen items-center justify-center px-6 py-12">
