@@ -1,0 +1,86 @@
+ [
+  {
+    "id": 1,
+    "level": "beginner",
+    "topic": "Vocabulary",
+    "question": "What is the opposite of hot?",
+    "answer": "cold"
+  },
+  {
+    "id": 2,
+    "level": "beginner",
+    "topic": "Grammar",
+    "question": "What is the plural of book?",
+    "answer": "books"
+  },
+  {
+    "id": 3,
+    "level": "beginner",
+    "topic": "Spelling",
+    "question": "Which word is spelled correctly: 'Appel' or 'Apple'?",
+    "answer": "Apple"
+  },
+  {
+    "id": 4,
+    "level": "beginner",
+    "topic": "Vocabulary",
+    "question": "What animal says 'moo' and gives us milk?",
+    "answer": "cow"
+  },
+  {
+    "id": 5,
+    "level": "intermediate",
+    "topic": "Grammar",
+    "question": "Complete the sentence: She ___ to school every day.",
+    "answer": "goes"
+  },
+  {
+    "id": 6,
+    "level": "intermediate",
+    "topic": "Vocabulary",
+    "question": "What is a synonym for 'happy': joyful or miserable?",
+    "answer": "joyful"
+  },
+  {
+    "id": 7,
+    "level": "intermediate",
+    "topic": "Tenses",
+    "question": "Choose the correct past tense: Yesterday, I ___ (write / wrote) a story.",
+    "answer": "wrote"
+  },
+  {
+    "id": 8,
+    "level": "intermediate",
+    "topic": "Prepositions",
+    "question": "Fill in the blank: The cat is sitting ___ (on / in) the table.",
+    "answer": "on"
+  },
+  {
+    "id": 9,
+    "level": "advanced",
+    "topic": "Idioms",
+    "question": "What does the English idiom 'piece of cake' mean?",
+    "answer": "Something that is very easy to do."
+  },
+  {
+    "id": 10,
+    "level": "advanced",
+    "topic": "Grammar",
+    "question": "Identify the passive voice in: 'The letter was written by Sarah.' Who performed the action?",
+    "answer": "Sarah"
+  },
+  {
+    "id": 11,
+    "level": "advanced",
+    "topic": "Vocabulary",
+    "question": "What does the word 'eloquent' mean?",
+    "answer": "Fluent, persuasive, and articulate in speaking or writing."
+  },
+  {
+    "id": 12,
+    "level": "advanced",
+    "topic": "Conditional Clauses",
+    "question": "Complete the conditional sentence: If it rains tomorrow, we ___ indoors.",
+    "answer": "will stay"
+  }
+]
