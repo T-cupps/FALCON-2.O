@@ -1,4 +1,7 @@
+import json
 import logging
+import os
+import random
 import re
 
 from dotenv import load_dotenv
@@ -21,10 +24,19 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 load_dotenv(".env.local")
 
-from db import get_user_by_name_or_id, init_db, list_all_users, save_user_profile  # noqa: E402
+from db import (  # noqa: E402
+    get_last_learning_topic,
+    get_recent_conversation_memory,
+    get_user_by_name_or_id,
+    init_db,
+    list_all_users,
+    save_conversation_turn,
+    save_user_profile,
+)
 from prompt import SYSTEM_PROMPT  # noqa: E402
 
 logger = logging.getLogger("agent")
+
 
 
 def extract_name_from_transcript(text: str) -> str | None:
@@ -172,6 +184,100 @@ class Assistant(Agent):
         )
         return result["message"]
 
+    @function_tool
+    async def get_exercise(self, context: RunContext, level: str):
+        """Retrieves an English learning exercise appropriate for the user's requested difficulty level. Call this function whenever the user asks for a new English exercise, practice question, quiz question, grammar question, vocabulary question, or speaking practice activity.
+
+        Args:
+            level: The learner's requested difficulty level ('beginner', 'intermediate', or 'advanced').
+        """
+        logger.info(f"Tool get_exercise called for level: '{level}'")
+        try:
+            clean_level = (level or "").strip().lower()
+            dataset_path = os.path.join(os.path.dirname(__file__), "exercises.json")
+
+            if not os.path.exists(dataset_path):
+                logger.error("Dataset file exercises.json missing.")
+                return "Sorry, I'm having trouble getting a learning exercise right now. Please try again in a moment."
+
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                exercises = json.load(f)
+
+            supported_levels = ["beginner", "intermediate", "advanced"]
+            if clean_level not in supported_levels:
+                logger.warning(
+                    f"Unsupported level requested: '{level}'. Level must be beginner, intermediate, or advanced."
+                )
+                matching = [e for e in exercises if e.get("level") == "beginner"]
+                selected = random.choice(matching) if matching else exercises[0]
+                return (
+                    f"Requested level '{level}' is not supported. Supported levels are beginner, intermediate, and advanced.\n"
+                    f"Here is a beginner exercise to start with:\n"
+                    f"- ID: {selected['id']}\n"
+                    f"- Level: {selected['level'].capitalize()}\n"
+                    f"- Topic: {selected['topic']}\n"
+                    f"- Question: {selected['question']}\n"
+                    f"- Answer: {selected['answer']}\n\n"
+                    f"INSTRUCTION: Explain gracefully that '{level}' is not a supported level (supported levels are beginner, intermediate, and advanced), then present this exercise and ask for their answer."
+                )
+
+            matching = [e for e in exercises if e.get("level", "").lower() == clean_level]
+            if not matching:
+                return "Sorry, I'm having trouble getting a learning exercise right now. Please try again in a moment."
+
+            selected = random.choice(matching)
+            logger.info(f"Retrieved exercise ID {selected['id']} for level '{clean_level}'")
+            return (
+                f"RETRIEVED EXERCISE FOR LEVEL '{clean_level.capitalize()}':\n"
+                f"- ID: {selected['id']}\n"
+                f"- Level: {selected['level'].capitalize()}\n"
+                f"- Topic: {selected['topic']}\n"
+                f"- Question: {selected['question']}\n"
+                f"- Answer: {selected['answer']}\n\n"
+                f"INSTRUCTION: Ask the user this question clearly and wait for their answer!"
+            )
+        except Exception as e:
+            logger.error(f"Error executing get_exercise tool: {e}")
+            return "Sorry, I'm having trouble getting a learning exercise right now. Please try again in a moment."
+
+    @function_tool
+    async def get_previous_learning_context(self, context: RunContext, identifier: str = ""):
+        """Retrieve relevant previous learning context or topics from prior conversations in the database. Call this function when the user asks what they were learning last time, asks to continue their previous practice, or asks about past sessions.
+
+        Args:
+            identifier: Optional caller name or user ID.
+        """
+        logger.info(
+            f"Tool get_previous_learning_context called for identifier: '{identifier}'"
+        )
+        try:
+            topic = get_last_learning_topic(user_id=identifier)
+            turns = get_recent_conversation_memory(user_id=identifier, limit=3)
+
+            if not topic and not turns:
+                return "I don't have any previous learning session to continue yet. We can start one now."
+
+            history_lines = []
+            if turns:
+                for t in turns:
+                    history_lines.append(
+                        f"- User: {t['user_message']} | Ved: {t['agent_response']}"
+                    )
+            history_str = (
+                "\n".join(history_lines) if history_lines else "No detailed history available."
+            )
+
+            return (
+                f"PREVIOUS SESSION RELEVANT CONTEXT:\n"
+                f"- Topic: {topic or 'English Practice'}\n"
+                f"- Recent Turns:\n{history_str}\n\n"
+                f"INSTRUCTION: Tell the user that last time you were practicing '{topic or 'English Practice'}', and offer to continue with another exercise or topic."
+            )
+        except Exception as e:
+            logger.error(f"Error executing get_previous_learning_context: {e}")
+            return "I'm having trouble accessing our previous conversation right now, but we can start a new practice session."
+
+
 
 server = AgentServer()
 
@@ -192,6 +298,9 @@ async def my_agent(ctx: JobContext):
 
     # Track active session user & topics dynamically
     active_user_name = None
+    last_user_transcript = ""
+
+    last_topic = get_last_learning_topic()
 
     saved_users = list_all_users()
     if saved_users:
@@ -201,7 +310,7 @@ async def my_agent(ctx: JobContext):
         topics_str = (
             ", ".join(returning_user["facts"]["topics_covered"])
             if returning_user["facts"]["topics_covered"]
-            else "reading & phonics"
+            else (last_topic or "reading & phonics")
         )
         dynamic_instructions = (
             f"\n\n[ACTIVE SESSION CALLER DATA]\n"
@@ -226,6 +335,13 @@ async def my_agent(ctx: JobContext):
             "When they agree ('Yes', 'Sure', 'Haan', 'Okay'), IMMEDIATELY call `save_learning_progress(name='[Name]', consent_given=True)`!\n"
         )
 
+    if last_topic:
+        dynamic_instructions += (
+            f"\n\n[PERSISTENT CONVERSATION MEMORY DATA]\n"
+            f"Most recent learning topic found in database: '{last_topic}'.\n"
+            f"If the user asks 'What were we learning last time?' or 'Let's continue my practice', remind them you were working on {last_topic} and use `get_exercise` to provide another exercise!"
+        )
+
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="multi"),
         llm=google.LLM(
@@ -245,12 +361,14 @@ async def my_agent(ctx: JobContext):
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev: UserInputTranscribedEvent):
-        nonlocal active_user_name
+        nonlocal active_user_name, last_user_transcript
         transcript = ev.transcript.strip()
         if not transcript:
             return
 
+        last_user_transcript = transcript
         transcript_lower = transcript.lower()
+
 
         # Dynamic name extraction & immediate SQLite save
         extracted_name = extract_name_from_transcript(transcript)
@@ -345,7 +463,42 @@ async def my_agent(ctx: JobContext):
             )
             session.tts.update_options(locale="en-IN")
 
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(ev):
+        nonlocal active_user_name, last_user_transcript
+        try:
+            item = getattr(ev, "item", None)
+            if not item:
+                return
+            role = getattr(item, "role", None)
+            content = getattr(item, "text_content", "") or getattr(item, "content", "")
+            if isinstance(content, list):
+                content = " ".join([str(c) for c in content])
+            text = str(content).strip()
+            if not text:
+                return
+
+            if role == "user":
+                last_user_transcript = text
+            elif role == "assistant" and last_user_transcript:
+                current_topic = (
+                    extract_topic_from_transcript(last_user_transcript)
+                    or get_last_learning_topic(active_user_name or "")
+                    or "General English"
+                )
+                save_conversation_turn(
+                    session_id=ctx.room.name,
+                    user_id=active_user_name or "guest",
+                    user_message=last_user_transcript,
+                    agent_response=text,
+                    topic=current_topic,
+                )
+                last_user_transcript = ""
+        except Exception as e:
+            logger.error(f"Error saving turn to conversation memory: {e}")
+
     await session.start(
+
         agent=Assistant(dynamic_instructions=dynamic_instructions),
         room=ctx.room,
         room_options=room_io.RoomOptions(
