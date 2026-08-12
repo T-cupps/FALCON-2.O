@@ -1,11 +1,12 @@
 import json
 import logging
 import os
-import random
-import re
+from datetime import datetime, timezone
+from urllib.parse import quote
 
+import httpx
 from dotenv import load_dotenv
-from livekit import rtc
+from livekit import api, rtc
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -24,266 +25,387 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 load_dotenv(".env.local")
 
-from db import (  # noqa: E402
-    get_last_learning_topic,
-    get_recent_conversation_memory,
-    get_user_by_name_or_id,
-    init_db,
-    list_all_users,
-    save_conversation_turn,
-    save_user_profile,
-)
-from prompt import SYSTEM_PROMPT  # noqa: E402
+import database  # noqa: E402
+from prompt import OUTBOUND_SYSTEM_PROMPT, SYSTEM_PROMPT  # noqa: E402
 
 logger = logging.getLogger("agent")
 
 
-
-def extract_name_from_transcript(text: str) -> str | None:
-    text_lower = text.lower().strip()
-    patterns = [
-        r"(?:my name is|i am|i'm|call me|this is)\s+([a-zA-Z\u0900-\u097F]+)",
-        r"^([a-zA-Z\u0900-\u097F]{2,15})$",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text_lower)
-        if match:
-            raw_name = match.group(1).capitalize()
-            if raw_name.lower() not in {
-                "yes",
-                "no",
-                "hello",
-                "hi",
-                "okay",
-                "thanks",
-                "sure",
-                "hindi",
-                "english",
-                "space",
-                "math",
-                "reading",
-            }:
-                return raw_name
-    return None
-
-
-def extract_topic_from_transcript(text: str) -> str | None:
-    text_lower = text.lower().strip()
-    patterns = [
-        r"(?:learn|study|practice|talk about|discuss|work on|about)\s+([a-zA-Z\u0900-\u097F\s]{3,35})",
-        r"(?:phonics|grammar|vocabulary|fractions|algebra|reading|science|math|history|space|english|hindi)",
-    ]
-    m = re.search(patterns[0], text_lower)
-    if m:
-        cand = m.group(1).strip()
-        cand = re.sub(r"\s+(?:today|please|now|with you|together)$", "", cand)
-        if len(cand) >= 3:
-            return cand.title()
-    m2 = re.search(patterns[1], text_lower)
-    if m2:
-        return m2.group(0).title()
-    return None
-
-
 class Assistant(Agent):
-    def __init__(self, dynamic_instructions: str = "") -> None:
-        instructions = SYSTEM_PROMPT + dynamic_instructions
-        super().__init__(instructions=instructions)
+    def __init__(self) -> None:
+        super().__init__(instructions=SYSTEM_PROMPT)
+
+    async def on_enter(self) -> None:
+        recent_caller = database.lookup_most_recent_caller()
+        if recent_caller and recent_caller.get("name"):
+            name = recent_caller.get("name", "")
+            facts = recent_caller.get("facts", {})
+            topics = (
+                facts.get("topics_covered")
+                or facts.get("target_goal")
+                or "your last lesson"
+            )
+            greeting = (
+                f"Namaste {name}! Welcome back to your AI Learning Assistant. "
+                f"Last time we worked on {topics}. Would you like to continue with that "
+                f"or explore something new today?"
+            )
+        else:
+            greeting = (
+                "Hi! I am your AI Learning Assistant. I can help you learn new concepts, "
+                "practice English, improve vocabulary, or study for your next lesson. "
+                "What would you like to explore today?"
+            )
+
+        activity = getattr(self, "_activity", None)
+        if activity is not None and hasattr(activity, "say"):
+            activity.say(greeting)
 
     @function_tool
-    async def lookup_user_profile(self, context: RunContext, identifier: str):
-        """Look up a caller's saved learning profile from the SQLite database by their name or ID.
-
-        IMMEDIATELY CALL THIS TOOL whenever a caller tells you their name (e.g. 'I am Prabh', 'My name is Sarah', 'Rahul').
+    async def lookup_caller(self, context: RunContext, user_id_or_name: str) -> str:
+        """Look up a caller in the database by their name or user ID to retrieve their stored memory and facts.
 
         Args:
-            identifier: The caller's name or user ID stated by the user.
+            user_id_or_name: The name or user ID of the caller to look up.
         """
-        logger.info(f"Tool lookup_user_profile called for identifier: '{identifier}'")
-        user = get_user_by_name_or_id(identifier)
-        if user:
-            logger.info(f"Found user profile in database: {user}")
-            topics_str = (
-                ", ".join(user["facts"]["topics_covered"])
-                if user["facts"]["topics_covered"]
-                else "Reading & Literacy"
+        logger.info(f"Function tool lookup_caller invoked for: {user_id_or_name}")
+        caller = database.lookup_caller(user_id_or_name)
+        if not caller:
+            caller = database.lookup_caller_by_name(user_id_or_name)
+        if not caller:
+            return json.dumps(
+                {"found": False, "message": f"No memory found for '{user_id_or_name}'."}
             )
-            mistakes_str = (
-                ", ".join(user["facts"]["mistakes_repeated"])
-                if user["facts"]["mistakes_repeated"]
-                else "None"
-            )
-            return (
-                f"FOUND SAVED RECORD FOR '{user['name']}':\n"
-                f"- Name: {user['name']}\n"
-                f"- Current Level: {user['facts']['current_level']}\n"
-                f"- Topics Covered Previously: {topics_str}\n"
-                f"- Repeated Mistakes: {mistakes_str}\n"
-                f"- Last Interaction: {user['last_interaction']}\n\n"
-                f"INSTRUCTION: Greet {user['name']} warmly by name! Mention what you worked on last time ({topics_str}), and ask if they would like to continue or try a new topic."
-            )
-        logger.info(f"No profile found for '{identifier}'.")
-        return (
-            f"NO SAVED RECORD FOUND for '{identifier}'. This caller is a NEW learner.\n"
-            f"INSTRUCTION: Greet {identifier} warmly! Ask for permission to save their learning progress: 'Nice to meet you {identifier}! May I save your learning progress as we practice today so I can remember you next time?'"
-        )
+        return json.dumps({"found": True, "caller": caller})
 
     @function_tool
-    async def save_learning_progress(
+    async def save_caller_memory(
         self,
         context: RunContext,
+        user_id: str,
         name: str,
-        consent_given: bool,
-        current_level: str = "Beginner",
-        topics_covered: str = "Reading & Literacy",
-        mistakes_repeated: str = "None",
-        user_id: str = "",
-    ):
-        """Save or update the caller's learning progress and topics in the SQLite database.
-
-        MANDATORY CONSENT RULE:
-        Before calling this function, you MUST ask the caller:
-        'May I save your learning progress so we can continue where we left off next time?'
-        If the caller agrees ('Yes', 'Sure', 'Haan', 'Okay', 'Fine'), pass consent_given=True.
-        If the caller declines ('No', 'Nahi', 'Don't save'), pass consent_given=False.
+        language_preference: str = "English",
+        facts_json: str = "{}",
+    ) -> str:
+        """Save or update caller information in the memory database. ONLY call this AFTER asking the user for permission and receiving explicit consent.
 
         Args:
-            name: The caller's name (e.g. 'Prabh', 'Sarah', 'Rahul').
-            consent_given: True ONLY IF the caller explicitly agreed to save their data; False if denied.
-            current_level: Learner level (e.g. 'Grade 3 Reading', 'Beginner Phonics', 'Intermediate Grammar').
-            topics_covered: Comma-separated list of topics discussed (e.g. 'Fractions, Vocabulary, Story Reading').
-            mistakes_repeated: Comma-separated list of mistakes to watch for (e.g. 'Silent e rules', 'Verb tenses', 'None').
-            user_id: Optional unique user ID. If empty, a slug based on name will be auto-generated.
+            user_id: Unique identifier for the caller (e.g. name lowercased).
+            name: Caller's name.
+            language_preference: Caller's preferred language (e.g. 'English', 'Hindi', 'Hinglish').
+            facts_json: JSON string containing caller facts such as current_level, topics_covered, mistakes_or_focus_areas, target_goal.
         """
-        logger.info(
-            f"Tool save_learning_progress called for '{name}', consent_given={consent_given}, topics='{topics_covered}'"
-        )
-        if not consent_given:
-            return f"Consent was NOT granted by {name}. No data was saved to database per privacy rules."
-
-        clean_user_id = user_id if user_id else name.lower().strip().replace(" ", "_")
-        topics_list = (
-            [t.strip() for t in topics_covered.split(",") if t.strip()]
-            if topics_covered
-            else ["Reading & Literacy"]
-        )
-        mistakes_list = (
-            [m.strip() for m in mistakes_repeated.split(",") if m.strip()]
-            if mistakes_repeated
-            else ["None"]
-        )
-
-        result = save_user_profile(
-            user_id=clean_user_id,
+        logger.info(f"Function tool save_caller_memory invoked for {name} ({user_id})")
+        database.save_caller(
+            user_id=user_id,
             name=name,
-            language_preference="English & Hindi",
-            current_level=current_level,
-            topics_covered=topics_list,
-            mistakes_repeated=mistakes_list,
-            consent_given=consent_given,
+            language_preference=language_preference,
+            facts=facts_json,
         )
-        return result["message"]
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Successfully saved memory for caller {name}.",
+            }
+        )
 
     @function_tool
-    async def get_exercise(self, context: RunContext, level: str):
-        """Retrieves an English learning exercise appropriate for the user's requested difficulty level. Call this function whenever the user asks for a new English exercise, practice question, quiz question, grammar question, vocabulary question, or speaking practice activity.
+    async def fetch_concept_knowledge(self, context: RunContext, topic: str) -> str:
+        """Fetch live educational topic summary, key facts, and revision timestamp from Wikipedia API.
+
+        Use this tool whenever the user asks for explanations, definitions, or summaries of educational concepts, scientific topics, historical events, or technology terms (e.g. "What is photosynthesis?", "Tell me about Black Holes").
 
         Args:
-            level: The learner's requested difficulty level ('beginner', 'intermediate', or 'advanced').
+            topic: The educational concept or topic name to search (e.g. 'Photosynthesis', 'Quantum Physics', 'Gravity').
         """
-        logger.info(f"Tool get_exercise called for level: '{level}'")
+        logger.info(f"Function tool fetch_concept_knowledge invoked for topic: {topic}")
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(topic)}"
+        headers = {
+            "User-Agent": "VoiceAILearningAssistant/1.0 (contact@example.com; educational livekit agent)"
+        }
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
         try:
-            clean_level = (level or "").strip().lower()
-            dataset_path = os.path.join(os.path.dirname(__file__), "exercises.json")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url, headers=headers)
 
-            if not os.path.exists(dataset_path):
-                logger.error("Dataset file exercises.json missing.")
-                return "Sorry, I'm having trouble getting a learning exercise right now. Please try again in a moment."
-
-            with open(dataset_path, "r", encoding="utf-8") as f:
-                exercises = json.load(f)
-
-            supported_levels = ["beginner", "intermediate", "advanced"]
-            if clean_level not in supported_levels:
-                logger.warning(
-                    f"Unsupported level requested: '{level}'. Level must be beginner, intermediate, or advanced."
-                )
-                matching = [e for e in exercises if e.get("level") == "beginner"]
-                selected = random.choice(matching) if matching else exercises[0]
-                return (
-                    f"Requested level '{level}' is not supported. Supported levels are beginner, intermediate, and advanced.\n"
-                    f"Here is a beginner exercise to start with:\n"
-                    f"- ID: {selected['id']}\n"
-                    f"- Level: {selected['level'].capitalize()}\n"
-                    f"- Topic: {selected['topic']}\n"
-                    f"- Question: {selected['question']}\n"
-                    f"- Answer: {selected['answer']}\n\n"
-                    f"INSTRUCTION: Explain gracefully that '{level}' is not a supported level (supported levels are beginner, intermediate, and advanced), then present this exercise and ask for their answer."
+            if response.status_code == 404:
+                logger.warning(f"Topic '{topic}' not found on Wikipedia (404).")
+                return json.dumps(
+                    {
+                        "success": False,
+                        "topic": topic,
+                        "error_type": "NOT_FOUND",
+                        "message": f"Educational topic '{topic}' was not found in the live Wikipedia database.",
+                        "instruction_for_agent": "Inform the learner out loud that the topic was not found in the live Wikipedia database, then provide a friendly general answer if you know it.",
+                        "data_retrieved_at": now_str,
+                    }
                 )
 
-            matching = [e for e in exercises if e.get("level", "").lower() == clean_level]
-            if not matching:
-                return "Sorry, I'm having trouble getting a learning exercise right now. Please try again in a moment."
+            response.raise_for_status()
+            data = response.json()
+            title = data.get("title", topic)
+            extract = data.get("extract", "")
+            revision_timestamp = data.get("timestamp", now_str)
 
-            selected = random.choice(matching)
-            logger.info(f"Retrieved exercise ID {selected['id']} for level '{clean_level}'")
-            return (
-                f"RETRIEVED EXERCISE FOR LEVEL '{clean_level.capitalize()}':\n"
-                f"- ID: {selected['id']}\n"
-                f"- Level: {selected['level'].capitalize()}\n"
-                f"- Topic: {selected['topic']}\n"
-                f"- Question: {selected['question']}\n"
-                f"- Answer: {selected['answer']}\n\n"
-                f"INSTRUCTION: Ask the user this question clearly and wait for their answer!"
+            return json.dumps(
+                {
+                    "success": True,
+                    "topic": topic,
+                    "title": title,
+                    "summary": extract,
+                    "revision_timestamp": revision_timestamp,
+                    "data_retrieved_at": now_str,
+                    "source": "Wikipedia REST API (Live Internet)",
+                    "instruction_for_agent": "Explain this live information clearly to the learner. State that this data is retrieved live from Wikipedia as of the provided timestamp.",
+                }
+            )
+        except httpx.TimeoutException:
+            logger.error(
+                f"Timeout while fetching concept knowledge for topic '{topic}'."
+            )
+            return json.dumps(
+                {
+                    "success": False,
+                    "topic": topic,
+                    "error_type": "TIMEOUT",
+                    "message": f"The request to fetch live data for '{topic}' timed out.",
+                    "instruction_for_agent": "Inform the learner out loud that the live internet service timed out, then offer a clear answer based on your knowledge base.",
+                    "data_retrieved_at": now_str,
+                }
             )
         except Exception as e:
-            logger.error(f"Error executing get_exercise tool: {e}")
-            return "Sorry, I'm having trouble getting a learning exercise right now. Please try again in a moment."
+            logger.error(f"Error fetching concept knowledge for '{topic}': {e}")
+            return json.dumps(
+                {
+                    "success": False,
+                    "topic": topic,
+                    "error_type": "CONNECTION_ERROR",
+                    "message": f"Could not connect to live internet data service for '{topic}': {e!s}",
+                    "instruction_for_agent": "Inform the learner out loud that the live network request failed, then provide a helpful explanation directly.",
+                    "data_retrieved_at": now_str,
+                }
+            )
 
     @function_tool
-    async def get_previous_learning_context(self, context: RunContext, identifier: str = ""):
-        """Retrieve relevant previous learning context or topics from prior conversations in the database. Call this function when the user asks what they were learning last time, asks to continue their previous practice, or asks about past sessions.
+    async def fetch_word_dictionary(self, context: RunContext, word: str) -> str:
+        """Fetch live dictionary definition, phonetic pronunciation, part of speech, and example sentence from Free Dictionary API.
+
+        Use this tool whenever the user asks for the definition, meaning, pronunciation, part of speech, or usage of a specific word (e.g. "What does perseverance mean?", "Define meticulous").
 
         Args:
-            identifier: Optional caller name or user ID.
+            word: The English word to define.
         """
-        logger.info(
-            f"Tool get_previous_learning_context called for identifier: '{identifier}'"
-        )
+        logger.info(f"Function tool fetch_word_dictionary invoked for word: {word}")
+        clean_word = word.strip().lower()
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{quote(clean_word)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
         try:
-            topic = get_last_learning_topic(user_id=identifier)
-            turns = get_recent_conversation_memory(user_id=identifier, limit=3)
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url, headers=headers)
 
-            if not topic and not turns:
-                return "I don't have any previous learning session to continue yet. We can start one now."
+            if response.status_code == 404:
+                logger.warning(f"Word '{clean_word}' not found in dictionary (404).")
+                return json.dumps(
+                    {
+                        "success": False,
+                        "word": clean_word,
+                        "error_type": "WORD_NOT_FOUND",
+                        "message": f"Word '{clean_word}' was not found in the live English dictionary.",
+                        "instruction_for_agent": "Inform the learner out loud that the word was not found in the live dictionary API, then give a helpful definition if you know it.",
+                        "data_retrieved_at": now_str,
+                    }
+                )
 
-            history_lines = []
-            if turns:
-                for t in turns:
-                    history_lines.append(
-                        f"- User: {t['user_message']} | Ved: {t['agent_response']}"
-                    )
-            history_str = (
-                "\n".join(history_lines) if history_lines else "No detailed history available."
+            response.raise_for_status()
+            data = response.json()
+
+            if not isinstance(data, list) or not data:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "word": clean_word,
+                        "error_type": "NO_ENTRY",
+                        "message": f"No entry returned for '{clean_word}'.",
+                        "instruction_for_agent": "Inform the learner out loud that no dictionary entry was returned.",
+                        "data_retrieved_at": now_str,
+                    }
+                )
+
+            first_entry = data[0]
+            phonetic = first_entry.get("phonetic", "")
+            if not phonetic and first_entry.get("phonetics"):
+                for p in first_entry["phonetics"]:
+                    if p.get("text"):
+                        phonetic = p["text"]
+                        break
+
+            meanings = first_entry.get("meanings", [])
+            part_of_speech = ""
+            definition = ""
+            example = ""
+
+            if meanings:
+                first_meaning = meanings[0]
+                part_of_speech = first_meaning.get("partOfSpeech", "")
+                defs = first_meaning.get("definitions", [])
+                if defs:
+                    definition = defs[0].get("definition", "")
+                    example = defs[0].get("example", "")
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "word": clean_word,
+                    "phonetic": phonetic,
+                    "part_of_speech": part_of_speech,
+                    "definition": definition,
+                    "example": example,
+                    "data_retrieved_at": now_str,
+                    "source": "Free Dictionary API (Live Internet)",
+                    "instruction_for_agent": "Explain the definition, phonetic pronunciation, part of speech, and example sentence clearly to the learner. State that this definition is retrieved as of live dictionary data.",
+                }
             )
-
-            return (
-                f"PREVIOUS SESSION RELEVANT CONTEXT:\n"
-                f"- Topic: {topic or 'English Practice'}\n"
-                f"- Recent Turns:\n{history_str}\n\n"
-                f"INSTRUCTION: Tell the user that last time you were practicing '{topic or 'English Practice'}', and offer to continue with another exercise or topic."
+        except httpx.TimeoutException:
+            logger.error(f"Timeout while fetching dictionary data for '{clean_word}'.")
+            return json.dumps(
+                {
+                    "success": False,
+                    "word": clean_word,
+                    "error_type": "TIMEOUT",
+                    "message": f"Request to live dictionary API for '{clean_word}' timed out.",
+                    "instruction_for_agent": "Inform the learner out loud that the live dictionary service timed out, then explain the word definition directly.",
+                    "data_retrieved_at": now_str,
+                }
             )
         except Exception as e:
-            logger.error(f"Error executing get_previous_learning_context: {e}")
-            return "I'm having trouble accessing our previous conversation right now, but we can start a new practice session."
-
+            logger.error(f"Error fetching dictionary data for '{clean_word}': {e}")
+            return json.dumps(
+                {
+                    "success": False,
+                    "word": clean_word,
+                    "error_type": "CONNECTION_ERROR",
+                    "message": f"Could not connect to live dictionary service for '{clean_word}': {e!s}",
+                    "instruction_for_agent": "Inform the learner out loud that the live network request failed, then define the word based on your knowledge.",
+                    "data_retrieved_at": now_str,
+                }
+            )
 
 
 server = AgentServer()
 
 
+# ---------------------------------------------------------------------------
+# Day 6 - Outbound English Practice: AssistantOutbound
+# ---------------------------------------------------------------------------
+
+OUTBOUND_OPENING_GENERIC = (
+    "Hello! This is your AI Learning Assistant calling for your daily "
+    "five-minute English practice session. You selected this time for your "
+    "practice call. If you'd rather not continue, just say 'stop'. "
+    "Is now a good time to practice?"
+)
+
+
+class AssistantOutbound(Agent):
+    """Outbound-specific agent for the daily English practice call.
+
+    Differences from the standard Assistant:
+    - Opens with the required outbound greeting (who, why, how-to-stop).
+    - Personalises the greeting using stored memory (name, level, topics).
+    - Exposes a stop_session function tool so the learner can end the call.
+    - Uses OUTBOUND_SYSTEM_PROMPT (shorter, practice-focused).
+    """
+
+    def __init__(self, ctx: JobContext) -> None:
+        self._ctx = ctx
+        self._session_ended = False
+        learner_name = os.environ.get("LEARNER_NAME", "").strip()
+
+        # Try to load learner memory: first by LEARNER_NAME, then most recent.
+        caller: dict | None = None
+        if learner_name:
+            caller = database.lookup_caller_by_name(learner_name)
+        if caller is None:
+            caller = database.lookup_most_recent_caller()
+
+        if caller and caller.get("name"):
+            name = caller["name"]
+            facts = caller.get("facts", {})
+            level = facts.get("current_level", "")
+            last_topic = facts.get("topics_covered") or facts.get("target_goal") or ""
+
+            greeting = (
+                f"Hello {name}! This is your AI Learning Assistant calling "
+                "for your daily five-minute English practice session. "
+                "You selected this time for your practice call. "
+                "If you'd rather not continue, just say 'stop'. "
+                "Is now a good time to practice?"
+            )
+
+            context_note = "\n\nLEARNER CONTEXT FOR THIS CALL:\n"
+            if level:
+                context_note += f"  - English level: {level}\n"
+            if last_topic:
+                context_note += f"  - Last topic: {last_topic}\n"
+            context_note += "Use this only to personalise the practice questions."
+            logger.info(
+                "Outbound call to returning learner '%s' (level=%s, topic=%s)",
+                name,
+                level or "unknown",
+                last_topic or "none",
+            )
+        else:
+            greeting = OUTBOUND_OPENING_GENERIC
+            context_note = ""
+            logger.info(
+                "Outbound call - no stored memory found; using generic opening."
+            )
+
+        self._greeting = greeting
+        super().__init__(instructions=OUTBOUND_SYSTEM_PROMPT + context_note)
+
+    async def on_enter(self) -> None:
+        """Deliver the opening after the answered SIP participant has joined."""
+        self.session.say(self._greeting, allow_interruptions=True)
+
+    @function_tool
+    async def stop_session(
+        self,
+        context: RunContext,
+    ) -> str:
+        """End the English practice session when the learner asks to stop.
+
+        Call this tool whenever the learner says 'stop', 'end the call',
+        'I don't want to continue', 'not now', 'bye', or similar.
+        Always say a polite goodbye BEFORE calling this tool.
+        """
+        if self._session_ended:
+            return '{"status": "already_ended"}'
+
+        self._session_ended = True
+        logger.info("stop_session tool invoked - deleting outbound call room.")
+
+        try:
+            await self._ctx.api.room.delete_room(
+                api.DeleteRoomRequest(room=self._ctx.room.name)
+            )
+        except Exception as e:
+            logger.warning("Error ending outbound room: %s", e)
+        finally:
+            self._ctx.shutdown("learner requested end of practice session")
+
+        return (
+            '{"status": "session_ended", "message": "Practice session ended. Goodbye!"}'
+        )
+
+
 def prewarm(proc: JobProcess):
-    init_db()
+    database.initialize_db()
     proc.userdata["vad"] = silero.VAD.load()
 
 
@@ -292,61 +414,28 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
+    if getattr(ctx.job, "metadata", "") == "outbound-practice":
+        await outbound_practice_agent(ctx)
+        return
+
+    # Logging setup
+    # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    # Track active session user & topics dynamically
-    active_user_name = None
-    last_user_transcript = ""
-
-    last_topic = get_last_learning_topic()
-
-    saved_users = list_all_users()
-    if saved_users:
-        returning_user = saved_users[0]
-        active_user_name = returning_user["name"]
-        logger.info(f"Auto-loaded returning caller profile: {returning_user['name']}")
-        topics_str = (
-            ", ".join(returning_user["facts"]["topics_covered"])
-            if returning_user["facts"]["topics_covered"]
-            else (last_topic or "reading & phonics")
-        )
-        dynamic_instructions = (
-            f"\n\n[ACTIVE SESSION CALLER DATA]\n"
-            f"RETURNING CALLER FOUND IN DATABASE: {returning_user['name']} (User ID: {returning_user['user_id']})\n"
-            f"- Current Level: {returning_user['facts']['current_level']}\n"
-            f"- Topics Covered Previously: {topics_str}\n"
-            f"- Repeated Mistakes to Watch: {', '.join(returning_user['facts']['mistakes_repeated']) or 'None'}\n"
-            f"- Preferred Language: {returning_user['language_preference']}\n"
-            f"- Last Interaction: {returning_user['last_interaction']}\n\n"
-            f"CRITICAL FIRST-TURN MANDATORY BEHAVIOR FOR RETURNING CALLER:\n"
-            f"You ALREADY know this caller is {returning_user['name']}! Do NOT ask 'What is your name?'.\n"
-            f"Greet {returning_user['name']} warmly BY NAME right on the very first turn! Example: 'Namaste {returning_user['name']}! Welcome back to your AI Learning Companion. Last time we practiced {topics_str}. Would you like to continue from where we left off or try something new today?'\n"
-        )
-    else:
-        logger.info("No saved users found in database. Starting session as NEW caller.")
-        dynamic_instructions = (
-            "\n\n[ACTIVE SESSION CALLER DATA]\n"
-            "No saved user profiles exist in the database. This is a NEW caller.\n"
-            "FIRST-TURN MANDATORY BEHAVIOR FOR NEW CALLER:\n"
-            "Greet the new learner and ask for their name! Example: 'Hi! Welcome to your AI Learning Companion. What is your name?'\n"
-            "As soon as they tell you their name (e.g. 'Prabh' or 'Rahul'), ask for permission: 'Nice to meet you [Name]! May I save your learning progress as we practice today so I remember you next time?'\n"
-            "When they agree ('Yes', 'Sure', 'Haan', 'Okay'), IMMEDIATELY call `save_learning_progress(name='[Name]', consent_given=True)`!\n"
-        )
-
-    if last_topic:
-        dynamic_instructions += (
-            f"\n\n[PERSISTENT CONVERSATION MEMORY DATA]\n"
-            f"Most recent learning topic found in database: '{last_topic}'.\n"
-            f"If the user asks 'What were we learning last time?' or 'Let's continue my practice', remind them you were working on {last_topic} and use `get_exercise` to provide another exercise!"
-        )
-
+    # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
     session = AgentSession(
+        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
+        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=deepgram.STT(model="nova-3", language="multi"),
+        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
+        # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
             model="gemini-3.5-flash-lite",
         ),
+        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
+        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
             voice="Abhinav",
             locale="en-IN",
@@ -354,57 +443,25 @@ async def my_agent(ctx: JobContext):
             tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
             text_pacing=True,
         ),
+        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
+        # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
+        # allow the LLM to generate a response while waiting for the end of turn
+        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev: UserInputTranscribedEvent):
-        nonlocal active_user_name, last_user_transcript
-        transcript = ev.transcript.strip()
+        transcript = ev.transcript.strip().lower()
         if not transcript:
             return
 
-        last_user_transcript = transcript
-        transcript_lower = transcript.lower()
+        # Check for Devanagari script characters (native Hindi)
+        has_devanagari = any(0x0900 <= ord(c) <= 0x097F for c in transcript)
 
-
-        # Dynamic name extraction & immediate SQLite save
-        extracted_name = extract_name_from_transcript(transcript)
-        if extracted_name:
-            active_user_name = extracted_name
-            logger.info(
-                f"Auto-extracted name '{extracted_name}' from transcript. Saving to SQLite DB."
-            )
-            save_user_profile(
-                user_id=extracted_name.lower(),
-                name=extracted_name,
-                language_preference="English & Hindi",
-                current_level="Beginner",
-                topics_covered=["Reading & Literacy"],
-                mistakes_repeated=[],
-                consent_given=True,
-            )
-
-        # Dynamic topic extraction & immediate SQLite update
-        extracted_topic = extract_topic_from_transcript(transcript)
-        if extracted_topic and active_user_name:
-            logger.info(
-                f"Auto-extracted topic '{extracted_topic}' for user '{active_user_name}'. Updating SQLite DB."
-            )
-            save_user_profile(
-                user_id=active_user_name.lower(),
-                name=active_user_name,
-                language_preference="English & Hindi",
-                current_level="Interactive Learning",
-                topics_covered=[extracted_topic],
-                mistakes_repeated=[],
-                consent_given=True,
-            )
-
-        has_devanagari = any(0x0900 <= ord(c) <= 0x097F for c in transcript_lower)
-
+        # Check for common Hinglish/Hindi romanized keywords
         hindi_keywords = {
             "kya",
             "hai",
@@ -449,7 +506,7 @@ async def my_agent(ctx: JobContext):
             "sab",
             "hindi",
         }
-        words = set(transcript_lower.split())
+        words = set(transcript.split())
         has_hindi_words = not words.isdisjoint(hindi_keywords)
 
         if has_devanagari or has_hindi_words:
@@ -463,43 +520,27 @@ async def my_agent(ctx: JobContext):
             )
             session.tts.update_options(locale="en-IN")
 
-    @session.on("conversation_item_added")
-    def on_conversation_item_added(ev):
-        nonlocal active_user_name, last_user_transcript
-        try:
-            item = getattr(ev, "item", None)
-            if not item:
-                return
-            role = getattr(item, "role", None)
-            content = getattr(item, "text_content", "") or getattr(item, "content", "")
-            if isinstance(content, list):
-                content = " ".join([str(c) for c in content])
-            text = str(content).strip()
-            if not text:
-                return
+    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
+    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
+    # 1. Install livekit-agents[openai]
+    # 2. Set OPENAI_API_KEY in .env.local
+    # 3. Add `from livekit.plugins import openai` to the top of this file
+    # 4. Use the following session setup instead of the version above
+    # session = AgentSession(
+    #     llm=openai.realtime.RealtimeModel(voice="marin")
+    # )
 
-            if role == "user":
-                last_user_transcript = text
-            elif role == "assistant" and last_user_transcript:
-                current_topic = (
-                    extract_topic_from_transcript(last_user_transcript)
-                    or get_last_learning_topic(active_user_name or "")
-                    or "General English"
-                )
-                save_conversation_turn(
-                    session_id=ctx.room.name,
-                    user_id=active_user_name or "guest",
-                    user_message=last_user_transcript,
-                    agent_response=text,
-                    topic=current_topic,
-                )
-                last_user_transcript = ""
-        except Exception as e:
-            logger.error(f"Error saving turn to conversation memory: {e}")
+    # # Add a virtual avatar to the session, if desired
+    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
+    # avatar = hedra.AvatarSession(
+    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
+    # )
+    # # Start the avatar and wait for it to join
+    # await avatar.start(session, room=ctx.room)
 
+    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-
-        agent=Assistant(dynamic_instructions=dynamic_instructions),
+        agent=Assistant(),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -513,7 +554,123 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
+    # Join the room and connect to the user
     await ctx.connect()
+
+
+# ---------------------------------------------------------------------------
+# Day 6 - Outbound English Practice: second @server.rtc_session handler
+# ---------------------------------------------------------------------------
+
+
+async def outbound_practice_agent(ctx: JobContext):
+    """Handler for the daily outbound English practice call.
+
+    This is dispatched by outbound_caller.py when the SIP call is placed.
+    The learner answers their Linphone, joins this room, and the
+    AssistantOutbound greets them with the required outbound opening.
+    """
+    ctx.log_context_fields = {
+        "room": ctx.room.name,
+        "agent": "outbound-practice",
+    }
+
+    session = AgentSession(
+        stt=deepgram.STT(model="nova-3", language="multi"),
+        llm=google.LLM(
+            model="gemini-3.5-flash-lite",
+        ),
+        tts=murf.TTS(
+            voice="Abhinav",
+            locale="en-IN",
+            style="Conversation",
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            text_pacing=True,
+        ),
+        turn_detection=MultilingualModel(),
+        vad=ctx.proc.userdata["vad"],
+        preemptive_generation=True,
+    )
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed_outbound(ev: UserInputTranscribedEvent):
+        """Same Hindi/Hinglish locale-switching logic as the inbound agent."""
+        transcript = ev.transcript.strip().lower()
+        if not transcript:
+            return
+
+        has_devanagari = any(0x0900 <= ord(c) <= 0x097F for c in transcript)
+        hindi_keywords = {
+            "kya",
+            "hai",
+            "aur",
+            "main",
+            "haan",
+            "nahin",
+            "aap",
+            "namaste",
+            "shukriya",
+            "mein",
+            "ke",
+            "ki",
+            "se",
+            "ko",
+            "ka",
+            "jo",
+            "toh",
+            "bhi",
+            "ho",
+            "kar",
+            "raha",
+            "rahi",
+            "rha",
+            "rhi",
+            "mujhe",
+            "mera",
+            "meri",
+            "hum",
+            "tum",
+            "apna",
+            "apni",
+            "karke",
+            "karo",
+            "karna",
+            "tha",
+            "thi",
+            "the",
+            "ab",
+            "kab",
+            "tab",
+            "sab",
+            "hindi",
+        }
+        words = set(transcript.split())
+        has_hindi_words = not words.isdisjoint(hindi_keywords)
+
+        if has_devanagari or has_hindi_words:
+            session.tts.update_options(locale="hi-IN")
+        else:
+            session.tts.update_options(locale="en-IN")
+
+    # Wait for the SIP participant before starting speech. Otherwise the opening
+    # can be spoken while Linphone is ringing and never reach the learner.
+    await ctx.connect()
+    await ctx.wait_for_participant(identity="learner")
+
+    await session.start(
+        agent=AssistantOutbound(ctx),
+        room=ctx.room,
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=lambda params: (
+                    noise_cancellation.BVCTelephony()
+                    if params.participant.kind
+                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                    else noise_cancellation.BVC()
+                ),
+            ),
+        ),
+    )
 
 
 if __name__ == "__main__":
